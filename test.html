@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Canary ASR/AST тест</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    label { display: block; margin: 12px 0 6px; }
+    input, select, button { margin-right: 8px; }
+    pre { background: #f5f5f5; padding: 12px; white-space: pre-wrap; }
+    .row { margin: 10px 0; }
+    .muted { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Загрузка аудио → /asr</h2>
+
+  <label>API URL</label>
+  <input id="apiUrl" type="text" value="http://localhost:8000" style="width: 360px;" />
+
+  <label>Языки</label>
+  <input id="sourceLang" type="text" value="en" placeholder="source_lang (напр. en)" />
+  <input id="targetLang" type="text" value="en" placeholder="target_lang (напр. en, fr, de...)" />
+
+  <label>Аудио файл</label>
+  <input id="fileInput" type="file" accept="audio/*,.wav,.flac,.mp3,.ogg,.webm" />
+  <div class="muted">или используйте запись с микрофона ниже</div>
+
+  <div class="row">
+    <button id="permBtn">Разрешить микрофон</button>
+    <button id="recStartBtn" disabled>Начать запись</button>
+    <button id="recStopBtn" disabled>Остановить запись</button>
+    <button id="recClearBtn" disabled>Очистить запись</button>
+    <label style="display:inline-block; margin-left:10px;">
+      <input type="checkbox" id="useRecorded" disabled /> Использовать записанное
+    </label>
+  </div>
+
+  <div class="row">
+    <audio id="preview" controls></audio>
+  </div>
+  <div id="recInfo" class="muted"></div>
+
+  <div style="margin:16px 0;">
+    <button id="sendBtn">Отправить</button>
+    <button id="downloadBtn" disabled>Скачать SRT</button>
+  </div>
+
+  <h3>Текст</h3>
+  <pre id="textOut"></pre>
+
+  <h3>SRT</h3>
+  <pre id="srtOut"></pre>
+
+  <script>
+    const apiUrlEl = document.getElementById('apiUrl');
+    const srcEl = document.getElementById('sourceLang');
+    const tgtEl = document.getElementById('targetLang');
+    const fileEl = document.getElementById('fileInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const dlBtn = document.getElementById('downloadBtn');
+    const textOut = document.getElementById('textOut');
+    const srtOut = document.getElementById('srtOut');
+
+    const permBtn = document.getElementById('permBtn');
+    const recStartBtn = document.getElementById('recStartBtn');
+    const recStopBtn = document.getElementById('recStopBtn');
+    const recClearBtn = document.getElementById('recClearBtn');
+    const useRecordedChk = document.getElementById('useRecorded');
+    const preview = document.getElementById('preview');
+    const recInfo = document.getElementById('recInfo');
+
+    let lastSrt = '';
+    let lastFilename = 'output.srt';
+
+    // MediaRecorder state
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recordedBlob = null;
+    let recordedMime = '';
+    let recordedUrl = '';
+
+    function pickSupportedMime() {
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg'
+      ];
+      for (const t of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) {
+          return t;
+        }
+      }
+      return '';
+    }
+
+    function updateRecUiState(state) {
+      // state: 'idle' | 'ready' | 'recording' | 'recorded'
+      if (state === 'idle') {
+        permBtn.disabled = false;
+        recStartBtn.disabled = true;
+        recStopBtn.disabled = true;
+        recClearBtn.disabled = true;
+        useRecordedChk.disabled = true;
+        useRecordedChk.checked = false;
+      } else if (state === 'ready') {
+        permBtn.disabled = true;
+        recStartBtn.disabled = false;
+        recStopBtn.disabled = true;
+        recClearBtn.disabled = !recordedBlob;
+        useRecordedChk.disabled = !recordedBlob;
+      } else if (state === 'recording') {
+        permBtn.disabled = true;
+        recStartBtn.disabled = true;
+        recStopBtn.disabled = false;
+        recClearBtn.disabled = true;
+        useRecordedChk.disabled = true;
+      } else if (state === 'recorded') {
+        permBtn.disabled = true;
+        recStartBtn.disabled = false;
+        recStopBtn.disabled = true;
+        recClearBtn.disabled = false;
+        useRecordedChk.disabled = false;
+        useRecordedChk.checked = true;
+      }
+    }
+
+    function revokeRecordedUrl() {
+      if (recordedUrl) {
+        URL.revokeObjectURL(recordedUrl);
+        recordedUrl = '';
+      }
+    }
+
+    function setRecInfo(text) {
+      recInfo.textContent = text || '';
+    }
+
+    permBtn.addEventListener('click', async () => {
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        updateRecUiState('ready');
+        setRecInfo('Микрофон доступен.');
+      } catch (e) {
+        setRecInfo('Доступ к микрофону отклонён: ' + e.message);
+      }
+    });
+
+    recStartBtn.addEventListener('click', () => {
+      if (!mediaStream) return;
+      recordedChunks = [];
+      recordedBlob = null;
+      revokeRecordedUrl();
+      recordedMime = pickSupportedMime();
+      try {
+        mediaRecorder = new MediaRecorder(mediaStream, recordedMime ? { mimeType: recordedMime } : undefined);
+      } catch (e) {
+        setRecInfo('Не удалось запустить запись: ' + e.message);
+        return;
+      }
+      mediaRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) recordedChunks.push(ev.data);
+      };
+      mediaRecorder.onstop = () => {
+        recordedBlob = new Blob(recordedChunks, { type: recordedMime || 'audio/webm' });
+        revokeRecordedUrl();
+        recordedUrl = URL.createObjectURL(recordedBlob);
+        preview.src = recordedUrl;
+        preview.load();
+        // Оценим длительность после загрузки метаданных
+        const tmp = new Audio();
+        tmp.src = recordedUrl;
+        tmp.addEventListener('loadedmetadata', () => {
+          const dur = isFinite(tmp.duration) ? tmp.duration : 0;
+          setRecInfo(`Получена запись: ${(recordedBlob.size/1024).toFixed(1)} KB, длительность ~ ${dur.toFixed(2)} c, mime=${recordedMime || 'auto'}`);
+        });
+        updateRecUiState('recorded');
+      };
+      mediaRecorder.start();
+      updateRecUiState('recording');
+      setRecInfo('Идёт запись... Нажмите «Остановить запись».');
+    });
+
+    recStopBtn.addEventListener('click', () => {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+      }
+    });
+
+    recClearBtn.addEventListener('click', () => {
+      recordedChunks = [];
+      recordedBlob = null;
+      revokeRecordedUrl();
+      preview.removeAttribute('src');
+      preview.load();
+      useRecordedChk.checked = false;
+      updateRecUiState('ready');
+      setRecInfo('');
+    });
+
+    dlBtn.addEventListener('click', () => {
+      if (!lastSrt) return;
+      const blob = new Blob([lastSrt], { type: 'application/x-subrip;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = lastFilename.replace(/\.[^.]+$/, '') + '.srt';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+
+    sendBtn.addEventListener('click', async () => {
+      const baseUrl = apiUrlEl.value.replace(/\/+$/, '');
+      const source_lang = srcEl.value.trim() || 'en';
+      const target_lang = tgtEl.value.trim() || 'en';
+
+      // Выбор источника: запись или файл
+      let useRecording = useRecordedChk.checked && !!recordedBlob;
+      const file = fileEl.files && fileEl.files[0];
+      if (!useRecording && !file) {
+        alert('Выберите аудио файл или запишите с микрофона');
+        return;
+      }
+
+      textOut.textContent = 'Отправка...';
+      srtOut.textContent = '';
+      dlBtn.disabled = true;
+      lastSrt = '';
+      lastFilename = useRecording ? (recordedMime.includes('ogg') ? 'recording.ogg' : 'recording.webm') : (file.name || 'audio');
+
+      try {
+        const fd = new FormData();
+        if (useRecording) {
+          fd.append('file', recordedBlob, lastFilename);
+        } else {
+          fd.append('file', file, file.name);
+        }
+        fd.append('source_lang', source_lang);
+        fd.append('target_lang', target_lang);
+
+        const res = await fetch(`${baseUrl}/asr`, {
+          method: 'POST',
+          body: fd
+        });
+
+        if (!res.ok) {
+          const errText = await res.text().catch(() => '');
+          throw new Error(`HTTP ${res.status}: ${errText}`);
+        }
+
+        const data = await res.json();
+        textOut.textContent = data.text || '';
+        srtOut.textContent = data.srt || '';
+        lastSrt = data.srt || '';
+        dlBtn.disabled = !lastSrt;
+      } catch (e) {
+        textOut.textContent = `Ошибка: ${e.message}`;
+      }
+    });
+
+    // Инициализация
+    updateRecUiState('idle');
+  </script>
+</body>
+</html>

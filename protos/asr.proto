@@ -1,0 +1,18 @@
+syntax = "proto3";
+package asr;
+
+service AsrService {
+    rpc Transcribe (TranscribeRequest) returns (TranscribeResponse) {}
+}
+
+message TranscribeRequest {
+    bytes audio = 1;
+    string filename = 2;
+    string source_lang = 3;
+    string target_lang = 4;
+}
+
+message TranscribeResponse {
+    string srt = 1;
+    string text = 2;
+}
